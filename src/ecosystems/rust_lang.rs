@@ -65,6 +65,9 @@ impl Ecosystem for RustEcosystem {
             });
         }
 
+        // Fetch descriptions from crates.io for packages lacking one.
+        backfill_descriptions(&mut packages);
+
         Ok(packages)
     }
 
@@ -80,6 +83,38 @@ impl Ecosystem for RustEcosystem {
             r"(?m)^\s*extern\s+crate\s+([a-zA-Z_][a-zA-Z0-9_]*)".to_string(),
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registry descriptions
+// ---------------------------------------------------------------------------
+
+/// Fetch descriptions from crates.io for any package still showing "N/A".
+fn backfill_descriptions(packages: &mut [PackageInfo]) {
+    for pkg in packages.iter_mut() {
+        if pkg.description == "N/A" {
+            if let Some(desc) = fetch_crate_description(&pkg.name) {
+                pkg.description = desc;
+            }
+        }
+    }
+}
+
+/// Query the crates.io API for a crate's description.
+/// Returns `None` on any network or parse error (graceful degradation).
+fn fetch_crate_description(name: &str) -> Option<String> {
+    let url = format!("https://crates.io/api/v1/crates/{}", name);
+    let body: serde_json::Value = ureq::get(&url)
+        .set("User-Agent", "pkgcheck/0.1.0")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    body.get("crate")?
+        .get("description")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------

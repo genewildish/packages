@@ -54,6 +54,9 @@ impl Ecosystem for RubyEcosystem {
             });
         }
 
+        // Fetch descriptions from RubyGems for packages lacking one.
+        backfill_descriptions(&mut packages);
+
         Ok(packages)
     }
 
@@ -68,6 +71,37 @@ impl Ecosystem for RubyEcosystem {
             r#"(?m)^\s*require[\s(]+['"]([^'"./][^'"]*)['"]"#.to_string(),
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registry descriptions
+// ---------------------------------------------------------------------------
+
+/// Fetch descriptions from RubyGems for any package still showing "N/A".
+fn backfill_descriptions(packages: &mut [PackageInfo]) {
+    for pkg in packages.iter_mut() {
+        if pkg.description == "N/A" {
+            if let Some(desc) = fetch_rubygems_description(&pkg.name) {
+                pkg.description = desc;
+            }
+        }
+    }
+}
+
+/// Query the RubyGems API for a gem's summary.
+fn fetch_rubygems_description(name: &str) -> Option<String> {
+    let url = format!("https://rubygems.org/api/v1/gems/{}.json", name);
+    let body: serde_json::Value = ureq::get(&url)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    // Prefer the short summary; fall back to the full info text.
+    body.get("summary")
+        .or_else(|| body.get("info"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
