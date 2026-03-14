@@ -1,0 +1,272 @@
+//! Terminal display for pkgcheck.
+//!
+//! Manages a compact status area (≤ 25 % of terminal height) that is
+//! redrawn in-place using ANSI cursor movement.  A background thread
+//! toggles the status indicator every 500 ms to produce a blinking effect
+//! while packages are being checked.
+
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use crossterm::{cursor, queue, style, terminal};
+use tabled::{settings::Style, Table};
+
+use crate::types::{EcosystemSummary, OverallStatus, PackageInfo};
+
+// ---------------------------------------------------------------------------
+// Shared state between main thread and blink thread
+// ---------------------------------------------------------------------------
+
+/// Internal state that the display thread reads on every tick.
+struct DisplayState {
+    /// One entry per ecosystem that has finished checking.
+    summaries: Vec<EcosystemSummary>,
+    /// The ecosystem currently being checked (shown as "checking…").
+    current_ecosystem: Option<String>,
+    /// Overall health indicator.
+    status: OverallStatus,
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Live terminal display with a blinking status indicator.
+///
+/// # Usage
+/// ```ignore
+/// let mut display = Display::new();
+/// display.start_ecosystem("Node.js");
+/// // ... do work ...
+/// display.finish_ecosystem(summary);
+/// display.set_final_status(OverallStatus::AllGood);
+/// display.finish();
+/// display.print_table(&packages);
+/// ```
+pub struct Display {
+    state: Arc<Mutex<DisplayState>>,
+    /// Signals the blink thread to stop.
+    is_running: Arc<AtomicBool>,
+    blink_handle: Option<thread::JoinHandle<()>>,
+    /// Maximum number of lines the status area may occupy.
+    max_lines: usize,
+}
+
+impl Display {
+    /// Create a new display and start the background refresh thread.
+    pub fn new() -> Self {
+        // Determine how many lines we're allowed to use (25 % of terminal).
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        let max_lines = ((rows as usize) / 4).max(4);
+
+        let state = Arc::new(Mutex::new(DisplayState {
+            summaries: Vec::new(),
+            current_ecosystem: None,
+            status: OverallStatus::Processing,
+        }));
+
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        // Reserve blank lines so subsequent renders can MoveUp into them.
+        {
+            let mut stdout = io::stdout();
+            for _ in 0..max_lines {
+                let _ = writeln!(stdout);
+            }
+            let _ = stdout.flush();
+        }
+
+        // Spawn a background thread that redraws the status area every 500 ms,
+        // alternating the indicator dot to create a blinking effect.
+        let state_ref = Arc::clone(&state);
+        let running_ref = Arc::clone(&is_running);
+        let ml = max_lines;
+        let handle = thread::spawn(move || {
+            let mut blink_on = true;
+            while running_ref.load(Ordering::Relaxed) {
+                render_status(&state_ref, ml, blink_on);
+                blink_on = !blink_on;
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        Self {
+            state,
+            is_running,
+            blink_handle: Some(handle),
+            max_lines,
+        }
+    }
+
+    /// Signal that we are starting to check a specific ecosystem.
+    pub fn start_ecosystem(&self, name: &str) {
+        if let Ok(mut s) = self.state.lock() {
+            s.current_ecosystem = Some(name.to_string());
+        }
+    }
+
+    /// Record the completed results for one ecosystem.
+    pub fn finish_ecosystem(&self, summary: EcosystemSummary) {
+        if let Ok(mut s) = self.state.lock() {
+            s.current_ecosystem = None;
+            s.summaries.push(summary);
+        }
+    }
+
+    /// Transition to the final (non-processing) status.
+    pub fn set_final_status(&self, status: OverallStatus) {
+        if let Ok(mut s) = self.state.lock() {
+            s.status = status;
+        }
+    }
+
+    /// Stop the background thread and do one final render (solid indicator).
+    pub fn finish(&mut self) {
+        self.is_running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.blink_handle.take() {
+            let _ = h.join();
+        }
+        // Final render with the dot always visible (no blink).
+        render_status(&self.state, self.max_lines, true);
+    }
+
+    /// Print the package summary table below the status area.
+    pub fn print_table(&self, packages: &[PackageInfo]) {
+        if packages.is_empty() {
+            println!("\n  No packages to display.");
+            return;
+        }
+
+        let rows: Vec<_> = packages.iter().map(|p| p.to_row()).collect();
+        let mut table = Table::new(rows);
+        table.with(Style::rounded());
+        println!("\n{}", table);
+    }
+}
+
+/// Ensure the blink thread is cleaned up if the Display is dropped early
+/// (e.g. on an error path).
+impl Drop for Display {
+    fn drop(&mut self) {
+        self.is_running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.blink_handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Redraw the entire status area.  Called by the background thread on each
+/// tick and once more by `Display::finish`.
+fn render_status(state: &Arc<Mutex<DisplayState>>, max_lines: usize, blink_on: bool) {
+    let Ok(s) = state.lock() else {
+        return;
+    };
+    let mut stdout = io::stdout();
+
+    // ── Move cursor to the top of the reserved area ──────────────────────
+    let _ = queue!(stdout, cursor::MoveUp(max_lines as u16));
+
+    let mut lines_written: usize = 0;
+
+    // ── Line 1: status header with coloured indicator ────────────────────
+    let (dot, color) = indicator_style(&s.status, blink_on);
+    let text = status_text(&s);
+
+    let _ = queue!(
+        stdout,
+        terminal::Clear(terminal::ClearType::CurrentLine),
+        style::Print("  Status:  "),
+        style::SetForegroundColor(color),
+        style::Print(dot),
+        style::ResetColor,
+        style::Print(format!(" {}\n", text)),
+    );
+    lines_written += 1;
+
+    // ── One line per completed ecosystem ─────────────────────────────────
+    for summary in &s.summaries {
+        if lines_written >= max_lines {
+            break;
+        }
+        let _ = queue!(
+            stdout,
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            style::Print(format!("  {}\n", format_summary(summary))),
+        );
+        lines_written += 1;
+    }
+
+    // ── Currently-checking ecosystem (if any) ────────────────────────────
+    if lines_written < max_lines {
+        if let Some(ref name) = s.current_ecosystem {
+            if s.status == OverallStatus::Processing {
+                let _ = queue!(
+                    stdout,
+                    terminal::Clear(terminal::ClearType::CurrentLine),
+                    style::Print(format!("  {:<10} checking…\n", format!("{}:", name))),
+                );
+                lines_written += 1;
+            }
+        }
+    }
+
+    // ── Pad remaining lines so the cursor returns to the expected spot ───
+    while lines_written < max_lines {
+        let _ = queue!(
+            stdout,
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            style::Print("\n"),
+        );
+        lines_written += 1;
+    }
+
+    let _ = stdout.flush();
+}
+
+/// Choose the indicator character and colour based on overall status.
+fn indicator_style(status: &OverallStatus, blink_on: bool) -> (&'static str, style::Color) {
+    match status {
+        OverallStatus::Processing => {
+            if blink_on {
+                ("●", style::Color::Green)
+            } else {
+                (" ", style::Color::Green) // invisible during off-phase
+            }
+        }
+        OverallStatus::AllGood => ("●", style::Color::Green),
+        OverallStatus::Partial => ("●", style::Color::Rgb { r: 255, g: 165, b: 0 }), // orange
+        OverallStatus::NoneInstalled => ("●", style::Color::Red),
+    }
+}
+
+/// Human-readable status message for the header line.
+fn status_text(state: &DisplayState) -> String {
+    match &state.status {
+        OverallStatus::Processing => match &state.current_ecosystem {
+            Some(name) => format!("checking {} packages…", name),
+            None => "checking for packages…".to_string(),
+        },
+        OverallStatus::AllGood => "all packages installed".to_string(),
+        OverallStatus::Partial => "some packages missing or outdated".to_string(),
+        OverallStatus::NoneInstalled => "no packages installed".to_string(),
+    }
+}
+
+/// Format one ecosystem summary line, e.g. `"Node.js:   5/8 installed, 2 missing"`.
+fn format_summary(summary: &EcosystemSummary) -> String {
+    let mut parts = vec![format!("{}/{} installed", summary.installed, summary.total)];
+    if summary.outdated > 0 {
+        parts.push(format!("{} outdated", summary.outdated));
+    }
+    if summary.missing > 0 {
+        parts.push(format!("{} missing", summary.missing));
+    }
+    format!("{:<10} {}", format!("{}:", summary.name), parts.join(", "))
+}
