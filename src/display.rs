@@ -6,7 +6,7 @@
 //! while packages are being checked.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -53,6 +53,8 @@ pub struct Display {
     blink_handle: Option<thread::JoinHandle<()>>,
     /// Maximum number of lines the status area may occupy.
     max_lines: usize,
+    /// How many lines the last render actually wrote (shared with blink thread).
+    lines_rendered: Arc<AtomicUsize>,
 }
 
 impl Display {
@@ -69,25 +71,18 @@ impl Display {
         }));
 
         let is_running = Arc::new(AtomicBool::new(true));
-
-        // Reserve blank lines so subsequent renders can MoveUp into them.
-        {
-            let mut stdout = io::stdout();
-            for _ in 0..max_lines {
-                let _ = writeln!(stdout);
-            }
-            let _ = stdout.flush();
-        }
+        let lines_rendered = Arc::new(AtomicUsize::new(0));
 
         // Spawn a background thread that redraws the status area every 500 ms,
         // alternating the indicator dot to create a blinking effect.
         let state_ref = Arc::clone(&state);
         let running_ref = Arc::clone(&is_running);
+        let lr_ref = Arc::clone(&lines_rendered);
         let ml = max_lines;
         let handle = thread::spawn(move || {
             let mut blink_on = true;
             while running_ref.load(Ordering::Relaxed) {
-                render_status(&state_ref, ml, blink_on);
+                render_status(&state_ref, ml, blink_on, &lr_ref);
                 blink_on = !blink_on;
                 thread::sleep(Duration::from_millis(500));
             }
@@ -98,6 +93,7 @@ impl Display {
             is_running,
             blink_handle: Some(handle),
             max_lines,
+            lines_rendered,
         }
     }
 
@@ -130,7 +126,7 @@ impl Display {
             let _ = h.join();
         }
         // Final render with the dot always visible (no blink).
-        render_status(&self.state, self.max_lines, true);
+        render_status(&self.state, self.max_lines, true, &self.lines_rendered);
     }
 
     /// Print the package summary table below the status area.
@@ -164,14 +160,25 @@ impl Drop for Display {
 
 /// Redraw the entire status area.  Called by the background thread on each
 /// tick and once more by `Display::finish`.
-fn render_status(state: &Arc<Mutex<DisplayState>>, max_lines: usize, blink_on: bool) {
+///
+/// Uses `prev_lines` to know how far to move the cursor up from the last
+/// render, so the status area only occupies exactly the lines it needs.
+fn render_status(
+    state: &Arc<Mutex<DisplayState>>,
+    max_lines: usize,
+    blink_on: bool,
+    prev_lines: &AtomicUsize,
+) {
     let Ok(s) = state.lock() else {
         return;
     };
     let mut stdout = io::stdout();
 
-    // ── Move cursor to the top of the reserved area ──────────────────────
-    let _ = queue!(stdout, cursor::MoveUp(max_lines as u16));
+    // ── Move cursor back to the top of the previous render ───────────────
+    let prev = prev_lines.load(Ordering::Relaxed);
+    if prev > 0 {
+        let _ = queue!(stdout, cursor::MoveUp(prev as u16));
+    }
 
     let mut lines_written: usize = 0;
 
@@ -217,8 +224,8 @@ fn render_status(state: &Arc<Mutex<DisplayState>>, max_lines: usize, blink_on: b
         }
     }
 
-    // ── Pad remaining lines so the cursor returns to the expected spot ───
-    while lines_written < max_lines {
+    // ── Clear any leftover lines from a previous (taller) render ─────────
+    while lines_written < prev {
         let _ = queue!(
             stdout,
             terminal::Clear(terminal::ClearType::CurrentLine),
@@ -226,6 +233,9 @@ fn render_status(state: &Arc<Mutex<DisplayState>>, max_lines: usize, blink_on: b
         );
         lines_written += 1;
     }
+
+    // Remember how many lines we wrote so the next render can MoveUp correctly.
+    prev_lines.store(lines_written, Ordering::Relaxed);
 
     let _ = stdout.flush();
 }
