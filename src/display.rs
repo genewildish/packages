@@ -11,7 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::{cursor, queue, style, terminal};
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyModifiers},
+    queue, style, terminal,
+};
 use tabled::{settings::Style, Table};
 
 use crate::types::{EcosystemSummary, OverallStatus, PackageInfo};
@@ -130,6 +134,10 @@ impl Display {
     }
 
     /// Print the package summary table below the status area.
+    ///
+    /// If the table fits in half the terminal height it is printed directly.
+    /// Otherwise an interactive scrollable view is shown (arrow keys / j-k to
+    /// scroll, q / Esc to exit).
     pub fn print_table(&self, packages: &[PackageInfo]) {
         if packages.is_empty() {
             println!("\n  No packages to display.");
@@ -139,7 +147,17 @@ impl Display {
         let rows: Vec<_> = packages.iter().map(|p| p.to_row()).collect();
         let mut table = Table::new(rows);
         table.with(Style::rounded());
-        println!("\n{}", table);
+        let rendered = format!("\n{}", table);
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        let (_, term_rows) = terminal::size().unwrap_or((80, 24));
+        let max_visible = (term_rows as usize) / 2;
+
+        if lines.len() <= max_visible {
+            println!("{}", rendered);
+        } else {
+            interactive_scroll(&lines, max_visible);
+        }
     }
 }
 
@@ -267,6 +285,122 @@ fn status_text(state: &DisplayState) -> String {
         OverallStatus::Partial => "some packages missing or outdated".to_string(),
         OverallStatus::NoneInstalled => "no packages installed".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive scrollable table
+// ---------------------------------------------------------------------------
+
+/// Display `lines` in a scrollable viewport of `height` rows.
+/// The user can scroll with ↑/↓, j/k, PgUp/PgDn, and exit with q or Esc.
+fn interactive_scroll(lines: &[&str], height: usize) {
+    // We reserve 1 row for the hint bar at the bottom.
+    let view_rows = height.saturating_sub(1).max(1);
+    let max_offset = lines.len().saturating_sub(view_rows);
+    let mut offset: usize = 0;
+    let mut stdout = io::stdout();
+
+    // Draw the initial frame *before* entering raw mode so the space exists.
+    draw_scroll_frame(&mut stdout, lines, offset, view_rows, max_offset);
+
+    // Enter raw mode to capture individual key presses.
+    let _ = terminal::enable_raw_mode();
+
+    loop {
+        if let Ok(evt) = event::read() {
+            match evt {
+                Event::Key(key) => {
+                    match key.code {
+                        // Exit
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
+                        // Scroll down
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if offset < max_offset {
+                                offset += 1;
+                            }
+                        }
+                        // Scroll up
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            offset = offset.saturating_sub(1);
+                        }
+                        // Page down
+                        KeyCode::PageDown | KeyCode::Char(' ') => {
+                            offset = (offset + view_rows).min(max_offset);
+                        }
+                        // Page up
+                        KeyCode::PageUp => {
+                            offset = offset.saturating_sub(view_rows);
+                        }
+                        // Home / End
+                        KeyCode::Home => offset = 0,
+                        KeyCode::End => offset = max_offset,
+                        _ => {}
+                    }
+                    // Redraw: move cursor up to overwrite the previous frame.
+                    let total_drawn = view_rows + 1; // view + hint bar
+                    let _ = queue!(stdout, cursor::MoveUp(total_drawn as u16));
+                    draw_scroll_frame(&mut stdout, lines, offset, view_rows, max_offset);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let _ = terminal::disable_raw_mode();
+}
+
+/// Render one frame of the scrollable viewport.
+fn draw_scroll_frame(
+    stdout: &mut io::Stdout,
+    lines: &[&str],
+    offset: usize,
+    view_rows: usize,
+    max_offset: usize,
+) {
+    let end = (offset + view_rows).min(lines.len());
+
+    for i in offset..end {
+        let _ = queue!(
+            stdout,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            style::Print(lines[i]),
+            style::Print("\r\n"),
+        );
+    }
+    // Pad any remaining rows if near the end.
+    for _ in (end - offset)..view_rows {
+        let _ = queue!(
+            stdout,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            style::Print("\r\n"),
+        );
+    }
+
+    // Hint bar
+    let position = format!("[{}-{}/{}]", offset + 1, end, lines.len());
+    let can_up = offset > 0;
+    let can_down = offset < max_offset;
+    let arrows = match (can_up, can_down) {
+        (true, true) => "↑↓ scroll",
+        (true, false) => "↑ scroll",
+        (false, true) => "↓ scroll",
+        (false, false) => "",
+    };
+    let _ = queue!(
+        stdout,
+        cursor::MoveToColumn(0),
+        terminal::Clear(terminal::ClearType::CurrentLine),
+        style::SetForegroundColor(style::Color::DarkGrey),
+        style::Print(format!("  {} {}  q to exit", position, arrows)),
+        style::ResetColor,
+        style::Print("\r\n"),
+    );
+    let _ = stdout.flush();
 }
 
 /// Format one ecosystem summary line, e.g. `"Node.js:   5/8 installed, 2 missing"`.

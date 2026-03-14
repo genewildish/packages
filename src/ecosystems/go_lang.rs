@@ -144,7 +144,7 @@ fn parse_require_line(line: &str) -> Option<(String, String)> {
 /// module_path → version.
 fn installed_go_modules(project_dir: &Path) -> HashMap<String, String> {
     let output = Command::new("go")
-        .args(["list", "-m", "all"])
+        .args(["list", "-m", "-mod=readonly", "all"])
         .current_dir(project_dir)
         .output();
 
