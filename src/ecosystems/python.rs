@@ -73,6 +73,9 @@ impl Ecosystem for PythonEcosystem {
             });
         }
 
+        // Fetch descriptions from PyPI for packages still showing "N/A".
+        backfill_descriptions(&mut packages);
+
         Ok(packages)
     }
 
@@ -88,6 +91,36 @@ impl Ecosystem for PythonEcosystem {
             r"(?m)^\s*from\s+([a-zA-Z_][a-zA-Z0-9_]*)".to_string(),
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registry descriptions
+// ---------------------------------------------------------------------------
+
+/// Fetch descriptions from PyPI for any package still showing "N/A".
+fn backfill_descriptions(packages: &mut [PackageInfo]) {
+    for pkg in packages.iter_mut() {
+        if pkg.description == "N/A" {
+            if let Some(desc) = fetch_pypi_description(&pkg.name) {
+                pkg.description = desc;
+            }
+        }
+    }
+}
+
+/// Query the PyPI JSON API for a package's summary.
+fn fetch_pypi_description(name: &str) -> Option<String> {
+    let url = format!("https://pypi.org/pypi/{}/json", name);
+    let body: serde_json::Value = ureq::get(&url)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    body.get("info")?
+        .get("summary")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------

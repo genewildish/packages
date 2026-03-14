@@ -49,6 +49,9 @@ impl Ecosystem for NodeEcosystem {
             }
         }
 
+        // Fetch descriptions from the npm registry for packages lacking one.
+        backfill_descriptions(&mut packages);
+
         Ok(packages)
     }
 
@@ -66,6 +69,37 @@ impl Ecosystem for NodeEcosystem {
             r#"import\s*\(\s*['"]([^'"\./][^'"]*?)(?:/[^'"]*)?['"]\s*\)"#.to_string(),
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registry descriptions
+// ---------------------------------------------------------------------------
+
+/// Fetch descriptions from the npm registry for any package still showing "N/A".
+fn backfill_descriptions(packages: &mut [PackageInfo]) {
+    for pkg in packages.iter_mut() {
+        if pkg.description == "N/A" {
+            if let Some(desc) = fetch_npm_description(&pkg.name) {
+                pkg.description = desc;
+            }
+        }
+    }
+}
+
+/// Query the npm registry for a package's description.
+/// Handles scoped packages (e.g. `@scope/name`) by URL-encoding the slash.
+fn fetch_npm_description(name: &str) -> Option<String> {
+    let encoded = name.replace('/', "%2F");
+    let url = format!("https://registry.npmjs.org/{}", encoded);
+    let body: serde_json::Value = ureq::get(&url)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    body.get("description")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
